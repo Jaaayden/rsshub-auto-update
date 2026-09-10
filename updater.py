@@ -240,6 +240,40 @@ Unit=rsshub-auto-update@{project}.service
 WantedBy=timers.target
 '''
 
+def validate_running_config(c, config, objects):
+    """Hashes are diagnostics, not portable proof of configuration drift.
+
+    Compare effective environment to the running image defaults to detect lost
+    shell interpolation and runtime overrides without exposing any values.
+    """
+    image_defaults = {}
+    for obj in objects:
+        labels = obj['Config'].get('Labels') or {}
+        if labels.get('com.docker.compose.project') != c['project']:
+            continue
+        service = labels.get('com.docker.compose.service')
+        if service not in config:
+            continue
+        image_id = obj['Image']
+        if image_id not in image_defaults:
+            image = json.loads(run(['docker', 'image', 'inspect', image_id]))[0]
+            image_defaults[image_id] = dict(x.split('=', 1) for x in image.get('Config', {}).get('Env', []) or [] if '=' in x)
+        expected_env = dict(image_defaults[image_id])
+        for key, value in config[service].get('environment', {}).items():
+            if value is None:
+                expected_env.pop(key, None)
+            else:
+                expected_env[key] = str(value)
+        actual_env = dict(x.split('=', 1) for x in obj['Config'].get('Env', []) or [] if '=' in x)
+        different = sorted(k for k in expected_env.keys() | actual_env.keys()
+                           if expected_env.get(k) != actual_env.get(k))
+        if different:
+            raise Failure(f"服务 {service} 的运行环境与 Compose/.env 不一致（字段：{', '.join(different)}）；请将启动时使用的变量还原到 .env 或 env_file")
+        expected_hash = compose(c, 'config', '--hash', service).strip().split()[-1]
+        if labels.get('com.docker.compose.config-hash') != expected_hash:
+            print(f'提示：{service} 配置哈希不同，环境检查已通过；后续更新以当前 Compose 文件为准', flush=True)
+
+
 def install(args):
     if sys.version_info < (3, 9):
         raise Failure('需要 Python 3.9+')
@@ -280,20 +314,7 @@ def install(args):
     # Reject interpolation that differs from the running deployment (including secrets).
     config = model(c)
     snapshot(c, config)
-    for obj in objects:
-        labels = obj['Config'].get('Labels') or {}
-        if labels.get('com.docker.compose.project') != project:
-            continue
-        service = labels.get('com.docker.compose.service')
-        if service not in config:
-            continue
-        expected_hash = compose(c, 'config', '--hash', service).strip().split()[-1]
-        if labels.get('com.docker.compose.config-hash') != expected_hash:
-            raise Failure('Compose 配置与运行容器不同；请先用原配置重新部署再安装')
-        env = dict(x.split('=', 1) for x in obj['Config'].get('Env', []) if '=' in x)
-        for k, v in config[service].get('environment', {}).items():
-            if v is not None and str(v) != env.get(k):
-                raise Failure('Compose 环境与运行容器不同；请先还原原部署环境')
+    validate_running_config(c, config, objects)
     if args.bark_url_file:
         url = Path(args.bark_url_file).read_text().strip()
     elif existing.get('bark_url'):

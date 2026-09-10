@@ -12,7 +12,7 @@ curl -fsSL https://raw.githubusercontent.com/Jaaayden/rsshub-auto-update/main/in
 
 root 用户可以去掉 `sudo`。首次安装会从终端**隐藏输入 Bark HTTPS 地址**；地址不会回显。安装后每天北京时间 **04:00** 执行，不立即更新、不发送测试通知、不改变服务器时区，关机错过的任务不会补跑。
 
-自动检测只有一个 RSSHub Compose 项目时直接安装；有多个候选或无法识别时退出，按提示指定项目和配置文件。每个服务必须有一个健康运行的容器，RSSHub、Redis、Browserless 必须配置健康检查。安装前请用原 Compose 文件完成正常部署，安装器会比较配置哈希，拒绝无法复现的启动环境。
+自动检测只有一个 RSSHub Compose 项目时直接安装；有多个候选或无法识别时退出，按提示指定项目和配置文件。每个服务必须有一个健康运行的容器，RSSHub、Redis、Browserless 必须配置健康检查。安装器检查当前 Compose/.env 能否还原容器环境；环境变量缺失或不同会列出字段名并停止，不显示值。配置哈希不同只作提示，无需为此重建容器；后续更新以当前 Compose 文件为准。
 
 安装器从 GitHub 解析 `main` 的 commit，将程序和 SHA256 清单固定到同一 commit 下载并校验。校验用于发现损坏或混合下载，不是独立发布者签名；信任边界是本仓库与 GitHub HTTPS。
 

@@ -118,6 +118,27 @@ class Tests(unittest.TestCase):
         with self.assertRaises(u.Failure):
             u.cookie_lock(path)
 
+    def test_hash_mismatch_is_diagnostic(self):
+        obj = {'Image': 'sha256:old', 'Config': {'Env': ['PATH=/bin', 'COOKIE=private-value'], 'Labels': {
+            'com.docker.compose.project': 'test', 'com.docker.compose.service': 'rsshub',
+            'com.docker.compose.config-hash': 'legacy'}}}
+        config = {'rsshub': {'environment': {'COOKIE': 'private-value'}}}
+        with patch.object(u, 'run', return_value=json.dumps([{'Config': {'Env': ['PATH=/bin']}}])), patch.object(u, 'compose', return_value='rsshub current'), contextlib.redirect_stdout(io.StringIO()) as out:
+            u.validate_running_config(self.c, config, [obj])
+        self.assertIn('环境检查已通过', out.getvalue())
+        self.assertNotIn('private-value', out.getvalue())
+
+    def test_environment_drift_still_blocks(self):
+        obj = {'Image': 'sha256:old', 'Config': {'Env': ['PATH=/bin', 'COOKIE=private-value'], 'Labels': {
+            'com.docker.compose.project': 'test', 'com.docker.compose.service': 'rsshub'}}}
+        for env in ({}, {'COOKIE': 'different-value'}, {'COOKIE': None}):
+            with self.subTest(env=env), patch.object(u, 'run', return_value=json.dumps([{'Config': {'Env': ['PATH=/bin']}}])):
+                with self.assertRaises(u.Failure) as error:
+                    u.validate_running_config(self.c, {'rsshub': {'environment': env}}, [obj])
+                self.assertIn('COOKIE', str(error.exception))
+                self.assertNotIn('private-value', str(error.exception))
+                self.assertNotIn('different-value', str(error.exception))
+
     def test_timer(self):
         text = u.unit_text('test', '04:00', 'Asia/Shanghai')
         self.assertIn('04:00:00 Asia/Shanghai', text)
