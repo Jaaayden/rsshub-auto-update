@@ -18,6 +18,7 @@ import time
 import urllib.parse
 import urllib.request
 import uuid
+import warnings
 
 BASE = Path('/etc/rsshub-auto-update')
 STATE = Path('/var/lib/rsshub-auto-update')
@@ -274,6 +275,17 @@ def validate_running_config(c, config, objects):
             print(f'提示：{service} 配置哈希不同，环境检查已通过；后续更新以当前 Compose 文件为准', flush=True)
 
 
+def prompt_bark_url():
+    try:
+        # Text r+ streams require seeking; terminals cannot seek. getpass opens
+        # its own unbuffered read/write tty, so this stream is only for output.
+        with open('/dev/tty', 'w') as tty, warnings.catch_warnings():
+            warnings.simplefilter('error', getpass.GetPassWarning)
+            return getpass.getpass('Bark HTTPS 地址（隐藏输入）：', stream=tty)
+    except (OSError, EOFError, getpass.GetPassWarning):
+        raise Failure('无法安全读取终端；无人值守安装请提供 --bark-url-file') from None
+
+
 def install(args):
     if sys.version_info < (3, 9):
         raise Failure('需要 Python 3.9+')
@@ -320,11 +332,7 @@ def install(args):
     elif existing.get('bark_url'):
         url = existing['bark_url']
     else:
-        try:
-            with open('/dev/tty', 'r+') as tty:
-                url = getpass.getpass('Bark HTTPS 地址（隐藏输入）：', stream=tty)
-        except (OSError, EOFError):
-            raise Failure('无终端，请提供 --bark-url-file') from None
+        url = prompt_bark_url()
     c.update(time=hour, timezone=zone, bark_url=bark_url(url))
     BASE.mkdir(mode=0o700, parents=True, exist_ok=True)
     STATE.mkdir(mode=0o700, parents=True, exist_ok=True)
