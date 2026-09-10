@@ -165,7 +165,8 @@ def notify(c, state, directory):
 def update(c):
     directory = STATE / c['project']
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-    state = {'id': os.environ.get('INVOCATION_ID') or uuid.uuid4().hex,
+    invocation = os.environ.get('INVOCATION_ID') if os.environ.get('SYSTEMD_EXEC_PID') == str(os.getpid()) else None
+    state = {'id': invocation or uuid.uuid4().hex,
              'time': datetime.datetime.now(datetime.timezone.utc).isoformat(), 'stage': '更新前检查', 'rollback': '未执行'}
     try:
         with contextlib.ExitStack() as stack:
