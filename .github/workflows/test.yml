@@ -12,7 +12,7 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: sudo apt-get update && sudo apt-get install -y shellcheck
       - run: shellcheck install.sh tests/integration.sh
       - run: bash -n install.sh tests/integration.sh
@@ -25,7 +25,7 @@ jobs:
       matrix:
         python-version: ['3.9', '3.13']
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
@@ -34,5 +34,5 @@ jobs:
     runs-on: ubuntu-latest
     needs: [lint, unit]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: bash tests/integration.sh
