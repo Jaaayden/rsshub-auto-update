@@ -257,12 +257,19 @@ def remember_images(c, directory, services, old):
     return stale
 
 def prune_images(directory, stale, protected):
-    """Remove only displaced backup images. Docker itself refuses in-use or multi-tag images."""
+    """Remove displaced backup images that have no repository tag left.
+
+    A tag that still names the image (for example a pinned version) is the
+    user's, so such images are kept. Docker also refuses in-use images.
+    """
     for image in sorted(stale - protected):
         try:
+            tags = json.loads(run(['docker', 'image', 'inspect', image, '--format', '{{json .RepoTags}}'], quiet=True) or 'null')
+            if tags:
+                continue
             run(['docker', 'image', 'rm', image], quiet=True)
             print(f'已清理旧镜像：{image[:19]}', flush=True)
-        except Failure:
+        except (Failure, ValueError):
             pass
     (directory / 'stale-images.json').unlink(missing_ok=True)
 
