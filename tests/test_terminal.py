@@ -7,7 +7,7 @@ import signal
 import sys
 import time
 import unittest
-import updater
+import updater  # noqa: F401  (import smoke test; subprocess cases import it too)
 
 class TerminalTests(unittest.TestCase):
     def child(self, code, reply=None):
