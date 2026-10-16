@@ -38,7 +38,7 @@ class Tests(unittest.TestCase):
                 with self.assertRaises(u.Failure):
                     u.model(self.c)
 
-    def scenario(self, changed=True, pull_fail=False, up_fail=0, backup=None, rm_fails=False):
+    def scenario(self, changed=True, pull_fail=False, up_fail=0, backup=None, rm_fails=False, repo_tags='[]'):
         services = {n: {'image': n + ':latest'} for n in ('rsshub', 'redis', 'browserless')}
         old = {n: 'sha256:old' for n in services}
         calls = []
@@ -56,6 +56,8 @@ class Tests(unittest.TestCase):
                 if backup is None:
                     raise u.Failure('no backup tag')
                 return backup
+            if args[:3] == ['docker', 'image', 'inspect'] and '{{json .RepoTags}}' in args:
+                return repo_tags
             if args[:3] == ['docker', 'image', 'rm'] and rm_fails:
                 raise u.Failure('in use')
             return 'sha256:new' if changed else 'sha256:old'
@@ -268,6 +270,12 @@ class Tests(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertIn(['docker', 'image', 'rm', 'sha256:older'], self.run_calls)
         self.assertEqual([x for x in self.run_calls if x[:3] == ['docker', 'image', 'rm']], [['docker', 'image', 'rm', 'sha256:older']])
+        self.assertFalse((self.root / 'test/stale-images.json').exists())
+
+    def test_images_with_a_user_tag_are_kept(self):
+        result, _, _ = self.scenario(backup='sha256:older', repo_tags='["diygod/rsshub:1.2"]')
+        self.assertEqual(result, 0)
+        self.assertEqual([x for x in self.run_calls if x[:3] == ['docker', 'image', 'rm']], [])
         self.assertFalse((self.root / 'test/stale-images.json').exists())
 
     def test_no_change_also_prunes(self):
