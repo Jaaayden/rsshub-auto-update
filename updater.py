@@ -273,13 +273,98 @@ def prune_images(directory, stale, protected):
             pass
     (directory / 'stale-images.json').unlink(missing_ok=True)
 
+def fingerprint(config):
+    """Identify an image family by what it runs; empty fingerprints are too generic to match."""
+    return (config.get('WorkingDir') or '', tuple(config.get('Entrypoint') or ()), tuple(config.get('Cmd') or ()))
+
+def image_layers(image):
+    return tuple((image.get('RootFS') or {}).get('Layers') or ())
+
+def sweep_candidates(protected):
+    """Untagged images that no container uses and that run the same program as one of the project's images.
+
+    This catches what the backup-tag tracking cannot: leftovers from before the
+    tracking existed, or from runs whose bookkeeping was lost. Images with any
+    tag, anything used by a container, every protected ID, and untagged
+    duplicates whose layers equal those of an image in use are never listed.
+    """
+    ids = list(dict.fromkeys(run(['docker', 'image', 'ls', '-a', '-q', '--no-trunc']).split()))
+    if not ids or not protected:
+        return []
+    images = json.loads(run(['docker', 'image', 'inspect', *ids]))
+    containers = run(['docker', 'ps', '-a', '-q']).split()
+    used = set(run(['docker', 'inspect', '--format', '{{.Image}}', *containers]).split()) if containers else set()
+    in_use = [x for x in images if x['Id'] in protected or x['Id'] in used]
+    known = {fingerprint(x.get('Config') or {}) for x in images if x['Id'] in protected}
+    known.discard(('', (), ()))
+    shielded = {image_layers(x) for x in in_use} - {()}
+    found = []
+    for image in images:
+        if image in in_use or image.get('RepoTags') or image_layers(image) in shielded:
+            continue
+        if fingerprint(image.get('Config') or {}) in known:
+            found.append({'id': image['Id'], 'created': (image.get('Created') or '')[:10], 'size': image.get('Size') or 0})
+    return sorted(found, key=lambda x: x['created'], reverse=True)
+
+def remove_images(images):
+    removed = 0
+    for image in images:
+        try:
+            run(['docker', 'image', 'rm', image['id']], quiet=True)
+            removed += 1
+        except Failure:
+            pass
+    return removed
+
 def finish(c, directory, stale, old, current):
     if not c.get('prune', True):
         return
+    protected = set(old.values()) | set(current.values())
     try:
-        prune_images(directory, stale, set(old.values()) | set(current.values()))
+        prune_images(directory, stale, protected)
     except Exception:
         print('旧镜像清理失败（不影响更新结果）', flush=True)
+    try:
+        found = sweep_candidates(protected)
+        if found:
+            print(f"已清理 {remove_images(found)}/{len(found)} 个历史遗留镜像（标称大小合计约 {sum(x['size'] for x in found) // 10**6} MB）", flush=True)
+    except Exception:
+        print('历史遗留镜像扫描失败（不影响更新结果）', flush=True)
+
+def container_images(c, services):
+    result = {}
+    for name in services:
+        for cid in compose(c, 'ps', '-a', '-q', name).split():
+            result[name] = json.loads(run(['docker', 'inspect', cid]))[0]['Image']
+    return result
+
+def prune_command(c, apply):
+    """Manual cleanup of leftover images; lists only unless apply is set."""
+    directory = STATE / c['project']
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        with lock(directory / 'update.lock'):
+            protected = set(container_images(c, model(c)).values())
+            try:
+                protected |= {x for x in read(directory / 'previous-images.json').values() if isinstance(x, str)}
+            except Exception:
+                pass
+            if not protected:
+                raise Failure('找不到运行中的服务，无法判断哪些镜像属于本项目')
+            found = sweep_candidates(protected)
+            if not found:
+                print('没有可清理的历史遗留镜像')
+                return 0
+            for image in found:
+                print(f"{image['id'][7:19]}  {image['created']}  {image['size'] // 10**6} MB")
+            total = sum(x['size'] for x in found) // 10**6
+            if not apply:
+                print(f'共 {len(found)} 个，标称大小合计约 {total} MB（共享层只会在无人使用时释放）。确认后加 --yes 执行删除')
+                return 0
+            print(f'已删除 {remove_images(found)}/{len(found)} 个镜像（仍被占用的会被 Docker 拒绝）')
+            return 0
+    except BlockingIOError:
+        raise Failure('更新正在运行，请稍后再试') from None
 
 def record_skip(directory):
     path = directory / 'skipped.json'
@@ -567,6 +652,9 @@ def build_parser():
     i.add_argument('--prune', action=argparse.BooleanOptionalAction, help='成功更新后清理被替换的旧备份镜像（默认开启）')
     for name in ('update', 'run', 'status', 'logs', 'test-notify', 'failure', 'uninstall'):
         sub.add_parser(name).add_argument('project')
+    prune = sub.add_parser('prune', help='清理本项目遗留的无标签旧镜像（默认只列出）')
+    prune.add_argument('project')
+    prune.add_argument('--yes', action='store_true', help='确认删除')
     return p
 
 
@@ -590,6 +678,8 @@ def main():
         fail_notify(args.project)
     elif args.command == 'test-notify':
         return 0 if send(c, {'stage': '测试通知', 'time': datetime.datetime.now(datetime.timezone.utc).isoformat()}) else 1
+    elif args.command == 'prune':
+        return prune_command(c, args.yes)
     elif args.command == 'run':
         print(run(['systemctl', 'start', unit + '.service']))
     elif args.command == 'status':

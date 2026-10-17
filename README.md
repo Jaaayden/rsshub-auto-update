@@ -49,6 +49,8 @@ sudo rsshub-auto-update run rsshub          # 经 systemd 手动更新
 sudo rsshub-auto-update status rsshub       # timer / service 状态
 sudo rsshub-auto-update logs rsshub         # 最近日志及失败通知日志
 sudo rsshub-auto-update test-notify rsshub  # 显式发送测试通知
+sudo rsshub-auto-update prune rsshub        # 列出可清理的历史遗留镜像（只列出，不删除）
+sudo rsshub-auto-update prune rsshub --yes  # 确认后删除；更新进行中会拒绝
 sudo rsshub-auto-update uninstall rsshub    # 移除该项目的自动更新任务（更新正在运行时拒绝，可重复执行）
 ```
 
@@ -62,8 +64,9 @@ sudo rsshub-auto-update uninstall rsshub    # 移除该项目的自动更新任�
 4. 有变化时执行整项目 `up -d --pull never --wait --wait-timeout 300`，Compose 按依赖关系更新。固定标签或 digest 保持原意，不会自动改成 `latest`。
 5. 重建失败时，用临时 Compose JSON 覆盖文件恢复全部服务原镜像，禁止拉取，再次等待健康检查。
 6. 更新成功（或无新镜像）后，清理**上一轮备份标签所指、已被本轮替换**的旧镜像，避免每日更新堆积占满磁盘。只删除工具自己记录过的镜像 ID，且仅当该镜像已没有任何仓库标签时才删（例如 `latest` 被新镜像取代后）；固定版本标签（如 `rsshub:1.2`）仍指向的镜像会保留，仍被容器使用的镜像 Docker 也会拒绝删除。更新失败时不清理，候选延后到下一次成功。可用 `--no-prune` 关闭。
+7. 同一时刻再做一次**历史遗留镜像扫描**，兜住第 6 步跟踪不到的情况（装上本工具之前堆积的旧镜像、记录丢失等）。扫描只处理同时满足以下条件的镜像：没有任何仓库标签、没有任何容器（含已停止的）使用、不是当前运行或回退目标，并且启动配置（工作目录、入口命令、默认命令）与本项目正在运行的某个镜像相同——也就是“本项目服务的旧版本”。其他程序的镜像、带标签的镜像、被容器使用的镜像都不会被列入。
 
-仅支持镜像部署，不执行本地构建，不启用额外 profiles，不操作其他项目，不执行全局 prune。最近一份旧镜像通过 `rsshub-auto-update-backup/项目/服务:previous` 标签保留，手工全量清理仍可能删除它们。
+仅支持镜像部署，不执行本地构建，不启用额外 profiles，不操作其他项目，不执行 `docker image prune`、`docker system prune` 等全局清理。最近一份旧镜像通过 `rsshub-auto-update-backup/项目/服务:previous` 标签保留，手工全量清理仍可能删除它们。
 
 **回退只恢复镜像，不恢复卷内数据。** Redis 版本变化或其他数据迁移可能无法通过旧镜像恢复。请自行维护数据备份；回退失败时先查看日志与容器状态，根据数据兼容性决定恢复备份或升级配置，不要清空数据卷。
 
