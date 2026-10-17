@@ -38,7 +38,7 @@ class Tests(unittest.TestCase):
                 with self.assertRaises(u.Failure):
                     u.model(self.c)
 
-    def scenario(self, changed=True, pull_fail=False, up_fail=0, backup=None, rm_fails=False, repo_tags='[]'):
+    def scenario(self, changed=True, pull_fail=False, up_fail=0, backup=None, rm_fails=False, repo_tags='[]', image_list=''):
         services = {n: {'image': n + ':latest'} for n in ('rsshub', 'redis', 'browserless')}
         old = {n: 'sha256:old' for n in services}
         calls = []
@@ -58,6 +58,8 @@ class Tests(unittest.TestCase):
                 return backup
             if args[:3] == ['docker', 'image', 'inspect'] and '{{json .RepoTags}}' in args:
                 return repo_tags
+            if args[:3] == ['docker', 'image', 'ls']:
+                return image_list
             if args[:3] == ['docker', 'image', 'rm'] and rm_fails:
                 raise u.Failure('in use')
             return 'sha256:new' if changed else 'sha256:old'
@@ -303,6 +305,136 @@ class Tests(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertEqual([x for x in self.run_calls if x[:3] in (['docker', 'image', 'rm'],)], [])
         self.assertFalse((self.root / 'test/stale-images.json').exists())
+
+    # --- sweep of leftover images ---------------------------------------------------------------
+    def fake_docker(self, images, used=(), rm_fail=()):
+        """images: id -> (tags, fingerprint config, size). Returns a run() replacement and the rm log."""
+        removed = []
+        def inspect_one(i):
+            tags, config, size, *layers = images[i]
+            return {'Id': i, 'RepoTags': tags, 'Config': config, 'Size': size, 'Created': '2026-10-0%sT00:00:00Z' % (len(i) % 9 + 1),
+                    'RootFS': {'Layers': layers[0] if layers else [i]}}
+        def run(args, **kw):
+            if args[:3] == ['docker', 'image', 'ls']:
+                return '\n'.join(list(images) + [next(iter(images))]) + '\n'     # duplicates must be tolerated
+            if args[:3] == ['docker', 'image', 'inspect']:
+                return json.dumps([inspect_one(i) for i in args[3:]])
+            if args[:3] == ['docker', 'ps', '-a']:
+                return '\n'.join('c' + str(n) for n in range(len(used))) + '\n' if used else ''
+            if args[:2] == ['docker', 'inspect']:
+                return '\n'.join(used) + '\n'
+            if args[:3] == ['docker', 'image', 'tag']:
+                return ''
+            if args[:3] == ['docker', 'image', 'rm']:
+                if args[3] in rm_fail:
+                    raise u.Failure('busy')
+                removed.append(args[3])
+                return ''
+            raise AssertionError(args)
+        return run, removed
+
+    RSSHUB = {'WorkingDir': '/app', 'Entrypoint': ['dumb-init', '--'], 'Cmd': ['npm', 'run', 'start']}
+    OTHER = {'WorkingDir': '/app', 'Entrypoint': ['docker-entrypoint.sh'], 'Cmd': ['pnpm', 'start']}
+
+    def test_sweep_selects_only_unused_untagged_same_family(self):
+        images = {
+            'sha256:cur': (['diygod/rsshub:latest'], self.RSSHUB, 600),
+            'sha256:old1': ([], self.RSSHUB, 640_000_000),            # leftover: remove
+            'sha256:old2': ([], self.RSSHUB, 641_000_000),            # leftover: remove
+            'sha256:pinned': (['diygod/rsshub:1.2'], self.RSSHUB, 600),  # user tag: keep
+            'sha256:inuse': ([], self.RSSHUB, 600),                   # a container uses it: keep
+            'sha256:prot': ([], self.RSSHUB, 600),                    # rollback target: keep
+            'sha256:twin': ([], self.RSSHUB, 600, ['sha256:cur']),    # same layers as an image in use: keep
+            'sha256:other': ([], self.OTHER, 2_000_000_000),          # another program: keep
+            'sha256:bare': ([], {}, 600),                             # no fingerprint: keep
+        }
+        run, removed = self.fake_docker(images, used=['sha256:inuse'])
+        with patch.object(u, 'run', side_effect=run):
+            found = u.sweep_candidates({'sha256:cur', 'sha256:prot'})
+        self.assertEqual(sorted(x['id'] for x in found), ['sha256:old1', 'sha256:old2'])
+        self.assertEqual(removed, [])                                  # listing never deletes
+
+    def test_sweep_ignores_scratch_like_fingerprints(self):
+        images = {'sha256:cur': ([ 'x:1'], {}, 1), 'sha256:junk': ([], {}, 1)}
+        run, _ = self.fake_docker(images)
+        with patch.object(u, 'run', side_effect=run):
+            self.assertEqual(u.sweep_candidates({'sha256:cur'}), [])
+
+    def test_remove_images_tolerates_busy_images(self):
+        run, removed = self.fake_docker({'sha256:a': ([], self.RSSHUB, 1), 'sha256:b': ([], self.RSSHUB, 1)}, rm_fail={'sha256:a'})
+        with patch.object(u, 'run', side_effect=run):
+            self.assertEqual(u.remove_images([{'id': 'sha256:a'}, {'id': 'sha256:b'}]), 1)
+        self.assertEqual(removed, ['sha256:b'])
+
+    def test_update_sweeps_leftovers_after_success(self):
+        run, removed = self.fake_docker({'sha256:new': (['rsshub:latest'], self.RSSHUB, 1), 'sha256:old': (['rsshub-auto-update-backup/test/rsshub:previous'], self.RSSHUB, 1),
+                                         'sha256:legacy': ([], self.RSSHUB, 1)})
+        services = {n: {'image': n + ':latest'} for n in ('rsshub',)}
+        def compose(c, *args, **kw):
+            return ''
+        def wrapped(args, **kw):
+            if args[:3] == ['docker', 'image', 'inspect'] and args[3].startswith(u.BACKUP_PREFIX):
+                raise u.Failure('none')
+            if args[:3] == ['docker', 'image', 'inspect'] and '--format' in args:
+                return 'sha256:new'
+            return run(args, **kw)
+        with patch.object(u, 'STATE', self.root), patch.object(u, 'cookie_lock', return_value=None), patch.object(u, 'model', return_value=services), \
+                patch.object(u, 'snapshot', return_value={'rsshub': 'sha256:old'}), patch.object(u, 'compose', side_effect=compose), \
+                patch.object(u, 'run', side_effect=wrapped), patch.object(u, 'send') as send, contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(u.update(self.c), 0)
+        send.assert_not_called()
+        self.assertEqual(removed, ['sha256:legacy'])
+        self.assertIn('1/1 个历史遗留镜像', out.getvalue())
+
+    def test_sweep_failure_does_not_fail_update(self):
+        result, _, send = self.scenario(image_list='sha256:junk\n')     # inspect returns non-JSON -> scan fails
+        self.assertEqual(result, 0)
+        send.assert_not_called()
+
+    def test_sweep_disabled_with_prune_off(self):
+        self.c['prune'] = False
+        self.scenario(image_list='sha256:junk\n')
+        self.assertEqual([x for x in self.run_calls if x[:3] == ['docker', 'image', 'ls']], [])
+
+    # --- prune command ---------------------------------------------------------------------------
+    def prune_env(self, images, used=()):
+        """Patch Docker/Compose for prune_command; patches end with the test."""
+        run, removed = self.fake_docker(images, used=used)
+        services = {'rsshub': {'image': 'diygod/rsshub'}}
+        def wrapped(args, **kw):
+            if args[:2] == ['docker', 'inspect'] and len(args) == 3:
+                return json.dumps([{'Image': 'sha256:cur'}])
+            return run(args, **kw)
+        stack = contextlib.ExitStack()
+        self.addCleanup(stack.close)
+        for patcher in (patch.object(u, 'STATE', self.root), patch.object(u, 'model', return_value=services),
+                        patch.object(u, 'compose', return_value='cid\n'), patch.object(u, 'run', side_effect=wrapped)):
+            stack.enter_context(patcher)
+        return removed
+
+    def test_prune_command_lists_by_default_and_deletes_with_yes(self):
+        images = {'sha256:cur': (['diygod/rsshub:latest'], self.RSSHUB, 1), 'sha256:old': ([], self.RSSHUB, 640_000_000), 'sha256:other': ([], self.OTHER, 1)}
+        removed = self.prune_env(images)
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(u.prune_command(self.c, False), 0)
+        self.assertEqual(removed, [])
+        self.assertIn('--yes', out.getvalue())
+        self.assertIn('640 MB', out.getvalue())
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(u.prune_command(self.c, True), 0)
+        self.assertEqual(removed, ['sha256:old'])
+
+    def test_prune_command_refuses_while_update_runs(self):
+        removed = self.prune_env({'sha256:cur': (['x:1'], self.RSSHUB, 1)})
+        with u.lock(self.root / 'test/update.lock'):
+            with self.assertRaises(u.Failure):
+                u.prune_command(self.c, True)
+        self.assertEqual(removed, [])
+
+    def test_prune_command_parsing(self):
+        args = u.build_parser().parse_args(['prune', 'rsshub'])
+        self.assertEqual((args.command, args.project, args.yes), ('prune', 'rsshub', False))
+        self.assertTrue(u.build_parser().parse_args(['prune', 'rsshub', '--yes']).yes)
 
     # --- installation artifacts -----------------------------------------------------------------
     def test_units_use_installer_interpreter(self):
